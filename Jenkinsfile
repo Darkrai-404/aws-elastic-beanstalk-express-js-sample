@@ -1,11 +1,5 @@
 pipeline {
-    agent {
-        // Use Node.js 16 Docker image as the build agent
-        docker {
-            image 'node:16-alpine'
-            args '-v /var/run/docker.sock:/var/run/docker.sock'
-        }
-    }
+    agent any
     
     environment {
         // Docker Hub credentials
@@ -19,56 +13,60 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                echo 'Checking out code from repository...'
+                echo '========== Checking out code from repository =========='
                 checkout scm
             }
         }
         
         stage('Install Dependencies') {
             steps {
-                echo 'Installing Node.js dependencies...'
-                sh 'npm install --save'
+                echo '========== Installing Node.js dependencies =========='
+                sh '''
+                    # Use Docker to run npm install
+                    docker run --rm -v $(pwd):/app -w /app node:16-alpine npm install --save
+                '''
             }
         }
         
         stage('Run Unit Tests') {
             steps {
-                echo 'Running unit tests...'
-                sh 'npm test || echo "No tests specified"'
+                echo '========== Running unit tests =========='
+                sh '''
+                    # Run tests in Node container
+                    docker run --rm -v $(pwd):/app -w /app node:16-alpine npm test || echo "No tests specified"
+                '''
             }
         }
         
         stage('Security Scan - Dependencies') {
             steps {
-                echo 'Running security vulnerability scan...'
+                echo '========== Running security vulnerability scan =========='
                 script {
-                    // Install Snyk CLI
-                    sh '''
-                        npm install -g snyk
-                        snyk --version
-                    '''
-                    
-                    // Authenticate with Snyk
-                    sh 'snyk auth $SNYK_TOKEN'
-                    
-                    // Run Snyk test and fail on high/critical vulnerabilities
-                    def snykResult = sh(
-                        script: 'snyk test --severity-threshold=high --json',
-                        returnStatus: true
-                    )
-                    
-                    if (snykResult != 0) {
+                    try {
+                        sh '''
+                            # Run Snyk in a container
+                            docker run --rm \
+                                -e SNYK_TOKEN=$SNYK_TOKEN \
+                                -v $(pwd):/app \
+                                -w /app \
+                                node:16-alpine sh -c "
+                                    npm install -g snyk && \
+                                    snyk auth $SNYK_TOKEN && \
+                                    snyk test --severity-threshold=high
+                                "
+                        '''
+                        echo '✅ Security scan passed - No High/Critical vulnerabilities found'
+                    } catch (Exception e) {
+                        echo "⚠️ Security scan failed: High or Critical vulnerabilities detected!"
                         error "Security scan failed: High or Critical vulnerabilities detected!"
                     }
-                    
-                    echo 'Security scan passed - No High/Critical vulnerabilities found'
                 }
             }
         }
         
         stage('Build Docker Image') {
             steps {
-                echo 'Building Docker image...'
+                echo '========== Building Docker image =========='
                 script {
                     // Creating Dockerfile if it doesn't exist
                     sh '''
@@ -88,13 +86,15 @@ EOF
                         docker build -t ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} .
                         docker tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ${DOCKER_IMAGE_NAME}:latest
                     """
+                    
+                    echo "✅ Docker image built: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
                 }
             }
         }
         
         stage('Push to Registry') {
             steps {
-                echo 'Pushing Docker image to registry...'
+                echo '========== Pushing Docker image to registry =========='
                 script {
                     // Login to Docker Hub and push image
                     withCredentials([usernamePassword(
@@ -106,8 +106,10 @@ EOF
                             echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
                             docker push ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}
                             docker push ${DOCKER_IMAGE_NAME}:latest
+                            docker logout
                         """
                     }
+                    echo "✅ Image pushed to Docker Hub: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
                 }
             }
         }
@@ -115,16 +117,21 @@ EOF
     
     post {
         success {
-            echo 'Pipeline completed successfully!'
+            echo '========================================='
+            echo '✅ Pipeline completed successfully!'
+            echo "📦 Docker image: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+            echo '========================================='
             // Archive build artifacts
             archiveArtifacts artifacts: '**/package*.json', allowEmptyArchive: true
         }
         failure {
-            echo 'Pipeline failed!'
+            echo '========================================='
+            echo '❌ Pipeline failed!'
+            echo '========================================='
         }
         always {
             echo 'Cleaning up workspace...'
-            cleanWs()
+            sh 'docker system prune -f || true'
         }
     }
 }
